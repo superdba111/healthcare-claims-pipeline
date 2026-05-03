@@ -16,4 +16,6 @@ Evaluation: All Python Lambda functions were executed and tested successfully, a
 
 6, Semantic Layer & Access (Q8): ✅ Pass. Section 6 provides three excellent, realistic RCM business views and defines a clear Role-Based Access Control (RBAC) matrix.
 
-7, AWS Services & Cost (Q9 & Budget): ✅ Pass. Section 7 details a 100% serverless stack that easily fits under the $5/month target (~$0.80 – $3.00/month estimated), completely avoiding expensive RDS?Redshift instances.
+7, AWS Architecture & Process Flow (Q9): ✅ Pass. Sections 3 and 7 clearly outline the step-by-step Medallion pipeline from raw ingestion to high-quality dataset (Raw → Bronze → Silver → Gold) and perfectly justify the 100% serverless AWS stack (S3, Lambda, Athena, Iceberg, Glue) used to achieve it.
+
+8, AWS Services & Cost (Q9 & Budget): ✅ Pass. Section 7 details a 100% serverless stack that easily fits under the $5/month target (~$0.80 – $3.00/month estimated), completely avoiding expensive RDS?Redshift instances.
