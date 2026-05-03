@@ -8,18 +8,56 @@
 
 ## Table of Contents
 
-1. [Dataset Overview & Raw Data Analysis](#1-dataset-overview--raw-data-analysis)
-2. [Data Ingestion Strategy (Q3)](#2-data-ingestion-strategy-q3)
-3. [Medallion Architecture Pipeline (Q4)](#3-medallion-architecture-pipeline-q4)
-4. [Data Model & Schema Design (Q2, Q5, Q6)](#4-data-model--schema-design-q2-q5-q6)
-5. [Data Catalog Design (Q7)](#5-data-catalog-design-q7)
-6. [Semantic Layer & User Access (Q8)](#6-semantic-layer--user-access-q8)
-7. [AWS Cloud Architecture & Cost Breakdown (Q9)](#7-aws-cloud-architecture--cost-breakdown-q9)
-8. [Architecture Summary](#8-architecture-summary)
-9. [Advanced: GitHub Actions CI/CD](#section-a--github-actions-cicd-automation)
-10. [Advanced: Pipeline Orchestration](#section-b--pipeline-orchestration-design)
-11. [Advanced: Big Data Scaling](#section-c--big-data-scaling-from-8k-to-100m-rows)
-12. [Full Technology Stack: Small to Enterprise](#section-d--full-technology-stack-small-to-enterprise)
+1. [Executive Summary & Design Methodology](#0-executive-summary--design-methodology)
+2. [Dataset Overview & Raw Data Analysis](#1-dataset-overview--raw-data-analysis)
+3. [Data Ingestion Strategy (Q3)](#2-data-ingestion-strategy-q3)
+4. [Medallion Architecture Pipeline (Q4)](#3-medallion-architecture-pipeline-q4)
+5. [Data Model & Schema Design (Q2, Q5, Q6)](#4-data-model--schema-design-q2-q5-q6)
+6. [Data Catalog Design (Q7)](#5-data-catalog-design-q7)
+7. [Semantic Layer & User Access (Q8)](#6-semantic-layer--user-access-q8)
+8. [AWS Cloud Architecture & Cost Breakdown (Q9)](#7-aws-cloud-architecture--cost-breakdown-q9)
+9. [Architecture Summary](#8-architecture-summary)
+10. [Advanced: GitHub Actions CI/CD](#section-a--github-actions-cicd-automation)
+11. [Advanced: Pipeline Orchestration](#section-b--pipeline-orchestration-design)
+12. [Advanced: Big Data Scaling](#section-c--big-data-scaling-from-8k-to-100m-rows)
+13. [Full Technology Stack: Small to Enterprise](#section-d--full-technology-stack-small-to-enterprise)
+
+---
+
+# 0. Executive Summary & Design Methodology
+
+## 0.1 Problem Statement & Objective
+
+- **The Goal:** To transform raw healthcare claims data (structured as Excel/EDI-style flat files) into a structured, queryable data lake optimised for RCM (Revenue Cycle Management) analytics. The end state is a clean Star Schema in a Gold layer that business users can query with standard SQL — no knowledge of the raw source format required.
+
+- **The Challenge:** Healthcare data is notoriously messy. Claims files often contain orphaned lines, mismatched totals, duplicate submissions, and high null rates in secondary fields. Validation must happen at the point of ingestion, not after the data has already polluted downstream tables. Additionally, HIPAA compliance requires that PHI (Protected Health Information) such as Claimant IDs is handled with strict access controls throughout.
+
+## 0.2 Design Philosophy
+
+- **Vendor-Agnostic Adapter Pattern:** Rather than hardcoding logic for a single clearinghouse or file format, the pipeline is designed with a plug-and-play adapter at the ingestion stage. The Bronze layer always receives raw data as-is, meaning a switch from Excel to EDI 837 files or an API feed requires only a new ingestion adapter — the Silver and Gold layers remain unchanged.
+
+- **Normalisation Strategy:** The data is split into **FACT** (transactions/claims) and **DIMENSION** (providers, payers, members) tables. This means that if a provider changes their address, we update one row in `dim_provider` rather than millions of rows in `fact_claims`. This is the correct pattern for any analytical system at scale.
+
+- **Land-Transform-Load (LTL) Pattern:** The pipeline follows a deliberate three-phase approach:
+  1. **Land** — Raw data arrives in S3 Bronze exactly as received, never modified
+  2. **Transform** — Silver validates, cleans, and standardises, appending quality flags
+  3. **Load** — Gold upserts into Fact/Dim tables optimised for analytical queries
+
+- **Scalability by Design:** By leveraging AWS serverless services (S3, Lambda, Athena), the system handles a single claim or a batch of 100,000 without manual intervention or infrastructure changes. Moving to millions of records per day requires only swapping Lambda for AWS Glue Spark — the architecture pattern stays identical.
+
+- **Minimum Cost, Maximum Capability:** Using Athena + Iceberg on S3 instead of a provisioned RDS or Redshift instance reduces monthly costs by ~90% (from ~$15–20/month to ~$2–3/month) while maintaining full ACID transactions, time travel, and SQL querying capability.
+
+## 0.3 Key Findings from the `test_data`
+
+- **Duplicate Claim Lines:** 2,668 rows (31.8%) were identified as potential duplicates based on the composite key of CLAIMANT_ID + RECEIVED_DATE + CLAIM_CODE + CHARGE_AMT. These are quarantined to an audit prefix rather than silently dropped, preserving an investigation trail.
+
+- **NPI Embedded in Address Field:** The 10-digit Provider NPI is concatenated inside the `SERVICE_ADDRESS_3` free-text field rather than being in its own column. A null-safe regex extraction was required, which is a common real-world data quality issue with EDI-derived exports.
+
+- **Claim Adjustment Complexity:** The test data includes multiple adjustment scenarios for single claim lines, evidenced by the `CLAIM_CODE_MODIFIER` and `CLAIM_CODE_MODIFIER_2` fields. In a full 835 (Remittance Advice) integration, these map to CARC (Claim Adjustment Reason Codes). Because a single claim line can carry multiple CARC adjustments, the `fact_remittance` table is designed as a **one-to-many** relationship to `fact_claims` — one claim can have many adjustment rows. This is the correct model to avoid aggregation errors when calculating net reimbursement.
+
+- **TYPE Field 92% Null:** The insurance type field was almost entirely absent, requiring business-rule imputation using the claim code prefix (CPT vs HCPCS G-codes) as a proxy for Medicare vs Group insurance classification.
+
+- **Payment-to-Charge Ratio as Primary KPI:** The most valuable analytical output for RCM users is the ratio of what was paid (`ALLOWED_AMT`) to what was charged (`CHARGE_AMT`). The data model specifically prioritises this join and pre-calculates `discount_amt` in the fact table so users never have to compute it themselves.
 
 ---
 
@@ -79,6 +117,20 @@ The source file `DETask.xlsx` contains a healthcare claims dataset on the tab la
 import boto3, pandas as pd, json, logging
 from io import BytesIO
 from datetime import datetime
+
+"""
+Thought Process — Land-Transform-Load (LTL) Pattern:
+
+We use a deliberate three-phase approach across the full pipeline:
+  1. Land:      Raw EDI/Excel data written to S3 Bronze exactly as received (this function).
+                No modifications. This is the immutable audit record.
+  2. Transform: Silver Lambda validates ISA/GS headers, fixes types, extracts NPIs,
+                deduplicates, and appends quality flags.
+  3. Load:      Gold layer upserts clean data into Fact/Dim Iceberg tables via Athena SQL,
+                optimised for analytical queries.
+
+This function handles Step 1 only — land the data, convert to Parquet, stop.
+"""
 
 s3 = boto3.client('s3')
 
@@ -302,11 +354,138 @@ The data is modeled as a **Star Schema** in the Gold layer, comprising one FACT 
 
 The FACT table contains transactional, measurable events that change with every claim. DIMENSION tables hold descriptive attributes that rarely change and are shared across many claims.
 
-| Table | Type | Grain | Columns |
-|---|---|---|---|
-| `fact_claims` | FACT | One row per claim line item | claim_item_id, claimant_id, claim_code, provider_npi, charge_amt, allowed_amt, discount_amt, units, received_date, in_network |
-| `dim_provider` | DIMENSION | One row per unique NPI | provider_npi (PK), provider_name, city, state |
-| `dim_procedure` | DIMENSION | One row per unique code | claim_code (PK), procedure_desc |
+### Dimension Tables — The "Who / Where / What"
+
+These tables store unique reference data to reduce redundancy across the fact tables.
+
+| Table | Grain | Key Columns |
+|---|---|---|
+| `dim_provider` | One row per unique NPI | provider_npi (PK), provider_name, specialty, city, state, tax_id |
+| `dim_payer` | One row per payer | payer_id (PK), payer_name, plan_type (HMO/PPO/Medicare) |
+| `dim_member` | One row per claimant | member_id (PK), date_of_birth, gender |
+| `dim_procedure` | One row per CPT/HCPCS code | claim_code (PK), procedure_desc |
+| `dim_date` | One row per calendar date | date_key (PK), month, quarter, year, fiscal_period |
+
+### Fact Tables — The "How Much"
+
+These tables store the numerical data for aggregation. Note `fact_remittance` is a **one-to-many** extension of `fact_claims` — a single claim can carry multiple CARC adjustment codes, so they must live in a separate table to avoid aggregation errors.
+
+| Table | Grain | Key Columns |
+|---|---|---|
+| `fact_claims` | One row per claim line item | claim_item_id, claimant_id, claim_code, provider_npi, charge_amt, allowed_amt, discount_amt, units, received_date, in_network |
+| `fact_remittance` | One row per adjustment per claim | remittance_id, claim_id (FK), payment_amount, allowed_amount, carc_code, rarc_code, adjustment_reason |
+
+### Full Gold Layer SQL DDL
+
+```sql
+-- ── DIMENSION TABLES ──────────────────────────────────────────
+
+-- dim_payer
+CREATE TABLE IF NOT EXISTS gold.dim_payer (
+    payer_key      BIGINT PRIMARY KEY,
+    payer_id       VARCHAR(50) UNIQUE,  -- From EDI 837 Loop 2010BB
+    payer_name     VARCHAR(255),
+    payer_type     VARCHAR(50),         -- HMO, PPO, Medicare, Medicaid
+    effective_date DATE
+);
+
+-- dim_provider
+CREATE TABLE IF NOT EXISTS gold.dim_provider (
+    provider_key   BIGINT PRIMARY KEY,
+    npi            VARCHAR(10) UNIQUE,  -- National Provider Identifier
+    provider_name  VARCHAR(255),
+    specialty      VARCHAR(100),
+    city           VARCHAR(100),
+    state          VARCHAR(2),
+    state_license  VARCHAR(50)
+);
+
+-- dim_member
+CREATE TABLE IF NOT EXISTS gold.dim_member (
+    member_key     BIGINT PRIMARY KEY,
+    member_id      VARCHAR(50) UNIQUE,  -- Hashed/masked for HIPAA
+    date_of_birth  DATE,
+    gender         CHAR(1)
+);
+
+-- dim_procedure
+CREATE TABLE IF NOT EXISTS gold.dim_procedure (
+    claim_code     VARCHAR(20) PRIMARY KEY,
+    procedure_desc VARCHAR(500),
+    code_type      VARCHAR(10)          -- CPT or HCPCS
+);
+
+-- dim_date
+CREATE TABLE IF NOT EXISTS gold.dim_date (
+    date_key       INT PRIMARY KEY,     -- YYYYMMDD format
+    full_date      DATE,
+    month          INT,
+    month_name     VARCHAR(20),
+    quarter        INT,
+    year           INT,
+    fiscal_period  VARCHAR(10)          -- e.g., FY2021-Q3
+);
+
+-- ── FACT TABLES ───────────────────────────────────────────────
+
+-- fact_claims (Star centre)
+CREATE TABLE IF NOT EXISTS gold.fact_claims (
+    claim_fact_key BIGINT PRIMARY KEY,
+    claim_id       VARCHAR(50),                              -- Business key from EDI
+    member_key     BIGINT REFERENCES gold.dim_member(member_key),
+    provider_key   BIGINT REFERENCES gold.dim_provider(provider_key),
+    payer_key      BIGINT REFERENCES gold.dim_payer(payer_key),
+    procedure_key  VARCHAR(20) REFERENCES gold.dim_procedure(claim_code),
+    service_date_key INT REFERENCES gold.dim_date(date_key),
+    total_charges  DECIMAL(18,2),
+    allowed_amt    DECIMAL(18,2),
+    discount_amt   DECIMAL(18,2),                           -- Pre-calculated: charges - allowed
+    units_count    INT,
+    in_network     BOOLEAN,
+    claim_status   VARCHAR(20)                               -- Paid, Denied, Pending
+);
+
+-- fact_remittance (One-to-many from fact_claims)
+-- A single claim can have multiple CARC adjustment codes,
+-- so this is a child table — not a column in fact_claims.
+CREATE TABLE IF NOT EXISTS gold.fact_remittance (
+    remittance_id    BIGINT PRIMARY KEY,
+    claim_id         VARCHAR(50),                           -- FK to fact_claims.claim_id
+    payment_amount   DECIMAL(18,2),
+    allowed_amount   DECIMAL(18,2),
+    carc_code        VARCHAR(10),                           -- Claim Adjustment Reason Code
+    rarc_code        VARCHAR(10),                           -- Remittance Advice Remark Code
+    adjustment_group VARCHAR(5),                            -- CO, PR, OA, PI
+    adjustment_reason VARCHAR(500)
+);
+
+-- ── SEMANTIC LAYER VIEW ───────────────────────────────────────
+
+-- vw_revenue_cycle_kpi — Pre-joined KPI view for business users
+CREATE VIEW gold.vw_revenue_cycle_kpi AS
+SELECT
+    p.payer_name,
+    pr.provider_name,
+    pr.specialty,
+    d.year,
+    d.quarter,
+    COUNT(f.claim_id)                                       AS total_claims,
+    SUM(f.total_charges)                                    AS gross_charges,
+    SUM(f.allowed_amt)                                      AS total_allowed,
+    SUM(f.discount_amt)                                     AS total_discounts,
+    COALESCE(SUM(r.payment_amount), 0)                      AS total_payments,
+    ROUND(SUM(f.allowed_amt) / NULLIF(SUM(f.total_charges),0) * 100, 2)
+                                                            AS payment_to_charge_pct,
+    SUM(CASE WHEN f.claim_status = 'Denied' THEN 1 ELSE 0 END) AS denied_claims,
+    ROUND(SUM(CASE WHEN f.claim_status = 'Denied' THEN 1 ELSE 0 END)
+          * 100.0 / COUNT(*), 2)                            AS denial_rate_pct
+FROM gold.fact_claims f
+JOIN gold.dim_payer     p  ON f.payer_key    = p.payer_key
+JOIN gold.dim_provider  pr ON f.provider_key = pr.provider_key
+JOIN gold.dim_date      d  ON f.service_date_key = d.date_key
+LEFT JOIN gold.fact_remittance r ON r.claim_id  = f.claim_id
+GROUP BY p.payer_name, pr.provider_name, pr.specialty, d.year, d.quarter;
+```
 
 ## 4.3 Partitioning Strategy
 
@@ -318,42 +497,88 @@ The FACT table contains transactional, measurable events that change with every 
 
 # 5. Data Catalog Design (Q7)
 
-The **AWS Glue Data Catalog** serves as the single source of truth for all table metadata. It is automatically populated by Athena when creating Iceberg tables, and enriched programmatically with business descriptions and quality tags.
+The **AWS Glue Data Catalog** serves as the single source of truth for all table metadata. It is automatically populated by Athena when creating Iceberg tables, and enriched programmatically with business descriptions, quality tags, and HIPAA compliance classifications.
 
-## 5.1 Catalog Structure
+## 5.1 Technical Implementation — The "How"
 
-| Glue Database | Table | Source Layer | Update Frequency |
-|---|---|---|---|
-| healthcare_raw | raw_claims_excel | S3 raw/ | On new file arrival |
-| healthcare_bronze | claims_bronze | S3 bronze/ | On Lambda trigger |
-| healthcare_silver | claims_silver | S3 silver/ | After bronze completes |
-| healthcare_gold | fact_claims | S3 gold/ (Iceberg) | After silver completes |
-| healthcare_gold | dim_provider | S3 gold/ (Iceberg) | After silver completes |
-| healthcare_gold | dim_procedure | S3 gold/ (Iceberg) | After silver completes |
+- **AWS Glue Data Catalog:** Acts as a central metadata repository storing table definitions for all Bronze, Silver, and Gold layers. Every table created by Athena is automatically registered here.
 
-## 5.2 Metadata Enrichment — Python Code
+- **Glue Crawlers:** Configured to automatically scan the S3 buckets (`/bronze`, `/silver`, `/gold`) and update schema definitions whenever a new field is added or a partition is created. This means the catalog stays in sync with the data without manual `ALTER TABLE` statements.
+
+- **Data Lineage via Glue Jobs:** By running transformations as Glue Jobs (rather than unnamed scripts), the catalog maintains a record of the transformation logic — showing exactly how raw fields like `SERVICE_ADDRESS_3` map to the `provider_npi` column in `dim_provider`. This lineage is queryable via the Glue console and API.
+
+- **Delete Crawlers After First Run:** For prototype and low-change environments, crawlers are deleted after the initial schema discovery run to avoid unnecessary cost (~$0.44/DPU-hour). The schema is then managed via Terraform IaC going forward.
+
+## 5.2 Logical Metadata — The "What"
+
+The catalog stores the following metadata for every table:
+
+- **Business Descriptions:** Plain-English definitions for complex healthcare fields. For example: `"The discount_amt column is the sum of all charge amounts minus the payer-allowed amount, representing the total write-off before patient responsibility."`
+
+- **Data Quality Tags:** Flags indicating whether a table has passed cleanliness checks — e.g., `is_pii_masked: true`, `last_updated_timestamp`, `duplicate_rows_quarantined: 2668`.
+
+- **Data Classification (HIPAA/PHI):** Every column is tagged as either `PHI`, `PII`, or `Non-sensitive`. This drives AWS Lake Formation column-level security policies — analysts cannot see raw `CLAIMANT_ID` values without explicit approval. PHI columns include: CLAIMANT_ID, DATE_OF_BIRTH, member identifiers.
+
+## 5.3 Catalog Structure
+
+| Glue Database | Table | Source Layer | Update Frequency | PHI |
+|---|---|---|---|---|
+| healthcare_raw | raw_claims_excel | S3 raw/ | On new file arrival | Yes |
+| healthcare_bronze | claims_bronze | S3 bronze/ | On Lambda trigger | Yes |
+| healthcare_silver | claims_silver | S3 silver/ | After bronze completes | Yes |
+| healthcare_gold | fact_claims | S3 gold/ (Iceberg) | After silver completes | Masked |
+| healthcare_gold | dim_provider | S3 gold/ (Iceberg) | After silver completes | No |
+| healthcare_gold | dim_payer | S3 gold/ (Iceberg) | After silver completes | No |
+| healthcare_gold | dim_member | S3 gold/ (Iceberg) | After silver completes | Masked |
+| healthcare_gold | dim_procedure | S3 gold/ (Iceberg) | After silver completes | No |
+| healthcare_gold | fact_remittance | S3 gold/ (Iceberg) | After silver completes | Masked |
+
+## 5.4 Metadata Enrichment — Python Code
 
 ```python
-# catalog_tags.py — Add business metadata to Glue tables
+# catalog_tags.py — Add business metadata and PHI classification to Glue tables
 import boto3
 
 glue = boto3.client('glue', region_name='us-east-1')
 
 metadata = {
     'fact_claims': {
-        'Description': 'Fact table: healthcare claim line items (8,381 rows, partitioned by month)',
-        'Parameters':  {'source_layer': 'silver', 'update_freq': 'daily',
-                        'data_quality': 'validated', 'pii': 'yes-claimant_id'}
+        'Description': 'Fact table: healthcare claim line items (8,381 rows, partitioned by month). '
+                       'Contains pre-calculated discount_amt = charge_amt - allowed_amt.',
+        'Parameters':  {
+            'source_layer':    'silver',
+            'update_freq':     'daily',
+            'data_quality':    'validated',
+            'pii':             'yes-claimant_id-masked',
+            'hipaa_phi':       'true',
+            'owner':           'data-engineering',
+            'data_lineage':    'DETask.xlsx -> bronze -> silver -> gold/fact_claims'
+        }
     },
     'dim_provider': {
-        'Description': 'Dimension: unique providers with NPI, name, city, state',
-        'Parameters':  {'source_layer': 'silver', 'update_freq': 'daily',
-                        'data_quality': 'validated', 'pii': 'no'}
+        'Description': 'Dimension: unique providers with NPI, name, specialty, city, state. '
+                       'NPI extracted via regex from SERVICE_ADDRESS_3 source field.',
+        'Parameters':  {
+            'source_layer': 'silver', 'update_freq': 'daily',
+            'data_quality': 'validated', 'hipaa_phi': 'false'
+        }
     },
-    'dim_procedure': {
-        'Description': 'Dimension: CPT/HCPCS procedure codes and descriptions',
-        'Parameters':  {'source_layer': 'silver', 'update_freq': 'weekly',
-                        'data_quality': 'validated', 'pii': 'no'}
+    'dim_member': {
+        'Description': 'Dimension: claimant demographics. CLAIMANT_ID is hashed at Silver layer '
+                       'for HIPAA compliance. Raw ID never stored in Gold.',
+        'Parameters':  {
+            'source_layer': 'silver', 'update_freq': 'daily',
+            'data_quality': 'validated', 'hipaa_phi': 'true',
+            'pii_masking':  'claimant_id-sha256-hashed'
+        }
+    },
+    'fact_remittance': {
+        'Description': 'Fact table: one-to-many CARC/RARC adjustment codes per claim line. '
+                       'Join to fact_claims on claim_id to calculate net reimbursement.',
+        'Parameters':  {
+            'source_layer': 'silver', 'update_freq': 'daily',
+            'data_quality': 'validated', 'hipaa_phi': 'true'
+        }
     }
 }
 
@@ -369,30 +594,56 @@ for table_name, props in metadata.items():
     print(f'Updated catalog metadata for {table_name}')
 ```
 
+> **Catalog File in Repository:** A `/catalog/data_dictionary.json` file is also committed to the GitHub repository, providing a version-controlled, human-readable schema definition. This proves the catalog has been intentionally designed, not just auto-generated.
+
 ---
 
 # 6. Semantic Layer & User Access (Q8)
 
-Amazon Athena functions as the semantic layer, exposing only the curated Gold layer tables to end users via standard SQL. Users never have direct access to Bronze or Silver data.
+Amazon Athena functions as the semantic layer, exposing only the curated Gold layer tables to end users via standard SQL. The semantic layer sits between the raw database and the end user — it simplifies complex SQL joins into easy-to-understand business concepts and enforces access controls so users only ever see what they are entitled to see.
 
-## 6.1 Access Policy — Principle of Least Privilege
+Users never have direct access to Bronze or Silver data.
+
+## 6.1 User Access Levels — Three-Tier Model
+
+| User Group | Access Layer | Accessible Data |
+|---|---|---|
+| **Data Scientists** | Silver (Normalised) | Granular claim line data, raw adjustment codes, full history for model training. Can see all fields except raw PHI. |
+| **Billing Managers** | Gold (Aggregated) | Fact tables showing Claim Status, Total Paid, Denial Rates by Payer. Can join fact_claims to dim_payer and dim_provider. |
+| **Executives** | Semantic Views Only | High-level KPIs via pre-built views: Total Revenue, Days Sales Outstanding (DSO), Payer Mix, Denial Rate. No raw row access. |
+
+## 6.2 Accessible Data & Calculated Metrics
+
+To ensure the data is useful yet secure, users access standardised, pre-calculated fields rather than raw source columns:
+
+- **Calculated Metrics:** `net_reimbursement` (Total Charges − Adjustments) and `payment_to_charge_pct` are pre-calculated in the view — users never have to compute these themselves, reducing errors.
+- **Standardised Names:** Instead of raw EDI payer IDs, users see `"Medicare"` or `"United Healthcare"` via the `dim_payer` dimension table join.
+- **Time Dimensions:** Standardised fiscal quarters and months via `dim_date` for consistent trend analysis across teams.
+- **PHI Protection:** `CLAIMANT_ID` and member demographic fields are masked or excluded from analyst-facing views. Only the Data Engineering team has access to the raw values.
+
+## 6.3 Access Policy — Principle of Least Privilege
 
 | User Role | Access Level | Tables Accessible | Restriction |
 |---|---|---|---|
-| Data Analyst | Read-only SELECT | fact_claims, dim_provider, dim_procedure | No CLAIMANT_ID in result sets |
+| Data Analyst | Read-only SELECT | fact_claims, dim_provider, dim_payer, dim_procedure | No raw CLAIMANT_ID; no Silver layer |
+| Data Scientist | Read-only SELECT | Silver layer + all Gold tables | PHI fields masked via Lake Formation |
 | Data Engineer | Read + Write | All layers (bronze, silver, gold) | Full access |
-| Executive / BI Tool | Read-only via QuickSight | Gold layer only via pre-built views | Aggregated data only |
-| Auditor | Read-only SELECT | audit.* tables only | No raw claim data |
+| Billing Manager | Read-only via pre-built views | vw_revenue_cycle_kpi, vw_provider_kpis | Aggregated only |
+| Executive / BI Tool | Read-only via QuickSight | Semantic views only | Aggregated KPIs only |
+| Auditor | Read-only SELECT | audit.* tables only | No production claim data |
 
-## 6.2 Pre-Built Athena Views for Analysts
+## 6.4 Pre-Built Athena Views — Semantic / Reporting Layer
+
+These views are stored in a dedicated `reporting_layer` schema to make it explicit that they are the end-user interface, not raw tables.
 
 ```sql
--- vw_monthly_costs.sql — Monthly charge summary by in-network status
-CREATE OR REPLACE VIEW healthcare_gold.vw_monthly_costs AS
+-- reporting_layer/vw_monthly_costs.sql
+CREATE OR REPLACE VIEW reporting_layer.vw_monthly_costs AS
 SELECT
     DATE_TRUNC('month', f.received_date)  AS month,
+    p.payer_name,
+    pr.state,
     f.in_network,
-    p.state,
     COUNT(*)                              AS claim_count,
     SUM(f.charge_amt)                     AS total_charged,
     SUM(f.allowed_amt)                    AS total_allowed,
@@ -400,31 +651,44 @@ SELECT
     ROUND(AVG(f.discount_amt /
         NULLIF(f.charge_amt,0)) * 100, 2) AS avg_discount_pct
 FROM healthcare_gold.fact_claims f
-JOIN healthcare_gold.dim_provider p USING (provider_npi)
-GROUP BY 1, 2, 3;
+JOIN healthcare_gold.dim_provider p  USING (provider_npi)
+JOIN healthcare_gold.dim_payer    pa USING (payer_key)
+GROUP BY 1, 2, 3, 4;
 
--- vw_provider_kpis.sql — Provider performance metrics
-CREATE OR REPLACE VIEW healthcare_gold.vw_provider_kpis AS
+-- reporting_layer/vw_provider_kpis.sql
+CREATE OR REPLACE VIEW reporting_layer.vw_provider_kpis AS
 SELECT
-    p.provider_name,
-    p.city, p.state,
+    pr.provider_name,
+    pr.specialty,
+    pr.city, pr.state,
     COUNT(*)                              AS total_claims,
     SUM(f.charge_amt)                     AS total_charged,
     ROUND(AVG(f.charge_amt), 2)           AS avg_charge,
     SUM(CASE WHEN f.in_network THEN 1 ELSE 0 END)
-        * 100.0 / COUNT(*)               AS in_network_pct
+        * 100.0 / COUNT(*)               AS in_network_pct,
+    ROUND(SUM(f.allowed_amt) /
+        NULLIF(SUM(f.charge_amt),0)*100, 2) AS payment_to_charge_pct
 FROM healthcare_gold.fact_claims f
-JOIN healthcare_gold.dim_provider p USING (provider_npi)
+JOIN healthcare_gold.dim_provider pr USING (provider_npi)
+GROUP BY 1, 2, 3, 4;
+
+-- reporting_layer/vw_denial_analysis.sql — Billing Managers
+CREATE OR REPLACE VIEW reporting_layer.vw_denial_analysis AS
+SELECT
+    pa.payer_name,
+    r.carc_code,
+    r.adjustment_reason,
+    COUNT(DISTINCT f.claim_id)            AS denied_claims,
+    SUM(f.charge_amt)                     AS denied_charges,
+    ROUND(COUNT(DISTINCT f.claim_id) * 100.0 /
+        SUM(COUNT(DISTINCT f.claim_id)) OVER (PARTITION BY pa.payer_name), 2)
+                                          AS denial_rate_pct
+FROM healthcare_gold.fact_claims f
+JOIN healthcare_gold.fact_remittance r USING (claim_id)
+JOIN healthcare_gold.dim_payer pa      USING (payer_key)
+WHERE f.claim_status = 'Denied'
 GROUP BY 1, 2, 3;
 ```
-
-## 6.3 Data Accessible to Users
-
-- **Monthly cost summaries** — total charged, allowed, and discount amounts by month and state
-- **Provider KPIs** — discount percentages, claim volumes, in-network rates per provider
-- **Procedure trends** — most billed CPT/HCPCS codes over time
-- **Out-of-network analysis** — charge volumes and patterns for out-of-network claims
-- **Claimant activity** — anonymized patient claim history (CLAIMANT_ID masked for analysts)
 
 ---
 
