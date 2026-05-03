@@ -45,7 +45,7 @@
 
 - **Scalability by Design:** By leveraging AWS serverless services (S3, Lambda, Athena), the system handles a single claim or a batch of 100,000 without manual intervention or infrastructure changes. Moving to millions of records per day requires only swapping Lambda for AWS Glue Spark — the architecture pattern stays identical.
 
-- **Minimum Cost, Maximum Capability:** Using Athena + Iceberg on S3 instead of a provisioned RDS or Redshift instance reduces monthly costs by ~90% (from ~$15–20/month to ~$2–3/month) while maintaining full ACID transactions, time travel, and SQL querying capability.
+- **Minimum Cost, Maximum Capability:** Using Athena + Iceberg on S3 instead of a provisioned RDS or Redshift instance reduces monthly costs by ~90% (from ~$15–20/month to ~$2–3/month) while maintaining full ACID transactions, time travel, and SQL querying capability. To maintain the ~$2–3 budget ceiling, S3 lifecycle policies automatically move old Bronze data to S3-IA after 30 days and Glacier after 90 days, reducing long-term storage costs by up to 80%. Athena charges are further controlled by Parquet partitioning, which reduces the data scanned per query by 70–90% compared to unpartitioned CSV files. See Section 7.4 for the full lifecycle policy code.
 
 ## 0.3 Key Findings from the `test_data`
 
@@ -251,6 +251,14 @@ def lambda_handler(event, context):
     # Impute TYPE nulls
     df = impute_type(df)
 
+    # PII Masking — hash CLAIMANT_ID in-flight before writing to Silver
+    # Raw ID is never stored beyond Bronze; SHA-256 is one-way and HIPAA-compliant
+    import hashlib
+    df['claimant_id'] = df['claimant_id'].apply(
+        lambda x: hashlib.sha256(str(x).encode('utf-8')).hexdigest()
+        if pd.notna(x) else None
+    )
+
     # Add metadata
     df['_cleaned_at'] = datetime.now().isoformat()
     df['is_valid']    = (~df['charge_amt'].isna()) & (~df['received_date'].isna())
@@ -374,6 +382,73 @@ These tables store the numerical data for aggregation. Note `fact_remittance` is
 |---|---|---|
 | `fact_claims` | One row per claim line item | claim_item_id, claimant_id, claim_code, provider_npi, charge_amt, allowed_amt, discount_amt, units, received_date, in_network |
 | `fact_remittance` | One row per adjustment per claim | remittance_id, claim_id (FK), payment_amount, allowed_amount, carc_code, rarc_code, adjustment_reason |
+
+## 4.2 Entity Relationship Diagram (Star Schema)
+
+```mermaid
+erDiagram
+    dim_date {
+        int date_key PK
+        date full_date
+        int month
+        int quarter
+        int year
+        string fiscal_period
+    }
+    dim_member {
+        bigint member_key PK
+        string member_id
+        date date_of_birth
+        string gender
+    }
+    dim_provider {
+        bigint provider_key PK
+        string npi
+        string provider_name
+        string specialty
+        string city
+        string state
+    }
+    dim_procedure {
+        string claim_code PK
+        string procedure_desc
+        string code_type
+    }
+    dim_payer {
+        bigint payer_key PK
+        string payer_id
+        string payer_name
+        string payer_type
+    }
+    fact_claims {
+        bigint claim_fact_key PK
+        string claim_id FK
+        bigint member_key FK
+        bigint provider_key FK
+        bigint payer_key FK
+        string procedure_key FK
+        int service_date_key FK
+        decimal total_charges
+        decimal allowed_amt
+        int units_count
+        boolean in_network
+    }
+    fact_remittance {
+        bigint remittance_id PK
+        string claim_id FK
+        decimal payment_amount
+        string carc_code
+        string rarc_code
+        string adjustment_reason
+    }
+    %% Relationships
+    dim_date ||--o{ fact_claims : "references"
+    dim_member ||--o{ fact_claims : "references"
+    dim_provider ||--o{ fact_claims : "references"
+    dim_payer ||--o{ fact_claims : "references"
+    dim_procedure ||--o{ fact_claims : "references"
+    fact_claims ||--o{ fact_remittance : "has many adjustments"
+```
 
 ### Full Gold Layer SQL DDL
 
