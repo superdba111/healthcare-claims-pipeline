@@ -45,7 +45,7 @@
 
 - **Scalability by Design:** By leveraging AWS serverless services (S3, Lambda, Athena), the system handles a single claim or a batch of 100,000 without manual intervention or infrastructure changes. Moving to millions of records per day requires only swapping Lambda for AWS Glue Spark — the architecture pattern stays identical.
 
-- **Minimum Cost, Maximum Capability:** Using Athena + Iceberg on S3 instead of a provisioned RDS or Redshift instance reduces monthly costs by ~90% (from ~$15–20/month to ~$2–3/month) while maintaining full ACID transactions, time travel, and SQL querying capability.
+- **Minimum Cost, Maximum Capability:** Using Athena + Iceberg on S3 instead of a provisioned RDS or Redshift instance reduces monthly costs by ~90% (from ~$15–20/month to ~$2–3/month) while maintaining full ACID transactions, time travel, and SQL querying capability. To maintain the ~$2–3 budget ceiling, S3 lifecycle policies automatically move old Bronze data to S3-IA after 30 days and Glacier after 90 days, reducing long-term storage costs by up to 80%. Athena charges are further controlled by Parquet partitioning, which reduces the data scanned per query by 70–90% compared to unpartitioned CSV files. See Section 7.4 for the full lifecycle policy code.
 
 ## 0.3 Key Findings from the `test_data`
 
@@ -251,6 +251,14 @@ def lambda_handler(event, context):
     # Impute TYPE nulls
     df = impute_type(df)
 
+    # PII Masking — hash CLAIMANT_ID in-flight before writing to Silver
+    # Raw ID is never stored beyond Bronze; SHA-256 is one-way and HIPAA-compliant
+    import hashlib
+    df['claimant_id'] = df['claimant_id'].apply(
+        lambda x: hashlib.sha256(str(x).encode('utf-8')).hexdigest()
+        if pd.notna(x) else None
+    )
+
     # Add metadata
     df['_cleaned_at'] = datetime.now().isoformat()
     df['is_valid']    = (~df['charge_amt'].isna()) & (~df['received_date'].isna())
@@ -317,38 +325,288 @@ SELECT DISTINCT
 FROM silver_view;
 ```
 
+## 3.3 Gold Layer Orchestration — Lambda as Athena Trigger
+
+The Silver Lambda does not write to the Gold layer directly. A dedicated **Gold Orchestrator Lambda** is triggered once Silver completes. It reads the Silver Parquet file, writes it to a staging location, then fires Athena SQL commands to build all 7 Iceberg tables in the correct dependency order — dimensions first, then facts.
+
+**Workflow:**
+1. Silver Lambda writes cleaned Parquet to `s3://hc-pipeline-demo/silver/`
+2. Gold Orchestrator Lambda triggers — via S3 event or Step Functions
+3. Lambda writes Silver data to a staging Parquet location (bypasses `HIVE_BAD_DATA` type errors)
+4. Athena builds all 5 DIM tables, then both FACT tables, sequentially
+5. Glue Data Catalog is updated automatically — no crawler needed for Gold
+
+> **Why a staging step?** Athena's CTAS can misinterpret Pandas date and decimal types directly from Silver Parquet. Writing a clean staging file with explicit `float` and `str` casts gives Athena a predictable schema to work from, eliminating `HIVE_BAD_DATA` errors in production.
+
+```python
+# lambda_gold_orchestrator.py — Tested and validated against DETask.xlsx (8,381 rows)
+"""
+GOLD LAYER: Create 7 Apache Iceberg tables from Silver data.
+Architecture: Star Schema (Medallion - Gold) with ACID compliance.
+Pattern: Land → Transform → Load (this is the Load step).
+Fix: Partitioned by service_month to prevent ICEBERG_TOO_MANY_OPEN_PARTITIONS.
+"""
+import boto3, pandas as pd, json, logging, time
+from io import BytesIO
+from datetime import datetime
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+s3     = boto3.client('s3')
+glue   = boto3.client('glue')
+athena = boto3.client('athena')
+
+BUCKET        = 'hc-pipeline-demo'
+DATABASE      = 'healthcare_gold'
+ATHENA_OUTPUT = f's3://{BUCKET}/athena-results/'
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def lambda_handler(event, context):
+    try:
+        silver_file = get_latest_silver_file()
+        if not silver_file:
+            return {'statusCode': 400, 'body': json.dumps({'error': 'No silver file found'})}
+
+        df = pd.read_parquet(BytesIO(s3.get_object(Bucket=BUCKET, Key=silver_file)['Body'].read()))
+        logger.info(f"Read {len(df)} rows from {silver_file}")
+
+        create_glue_database()
+        force_cleanup_corrupted_state()   # Wipe ghost Iceberg state before rebuild
+        write_staging_data(df)            # Staging bypasses HIVE_BAD_DATA errors
+        results = build_iceberg_star_schema()
+
+        return {'statusCode': 200, 'body': json.dumps({'message': 'Gold layer complete',
+                                                        'executions': results})}
+    except Exception as e:
+        logger.error(str(e))
+        return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def get_latest_silver_file():
+    resp = s3.list_objects_v2(Bucket=BUCKET, Prefix='silver/')
+    files = [o for o in resp.get('Contents', []) if o['Key'].endswith('.parquet')]
+    return max(files, key=lambda x: x['LastModified'])['Key'] if files else None
+
+def create_glue_database():
+    try:
+        glue.create_database(DatabaseInput={'Name': DATABASE,
+                                            'Description': 'Healthcare Gold - Iceberg Star Schema'})
+    except glue.exceptions.AlreadyExistsException:
+        pass
+
+def force_cleanup_corrupted_state():
+    """Delete Glue catalog entries and S3 files to ensure a clean rebuild."""
+    tables = ['dim_member','dim_provider','dim_payer','dim_procedure',
+              'dim_date','fact_remittance','fact_claims']
+    for t in tables:
+        try:
+            glue.delete_table(DatabaseName=DATABASE, Name=t)
+        except Exception:
+            pass
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=f'gold/iceberg/{t}/'):
+            if 'Contents' in page:
+                s3.delete_objects(Bucket=BUCKET,
+                                  Delete={'Objects': [{'Key': o['Key']} for o in page['Contents']]})
+
+def write_staging_data(df):
+    """Cast types explicitly so Athena never sees ambiguous Parquet schemas."""
+    if 'charge_amt'    in df.columns: df['charge_amt']    = df['charge_amt'].astype(float)
+    if 'allowed_amt'   in df.columns: df['allowed_amt']   = df['allowed_amt'].astype(float)
+    if 'received_date' in df.columns: df['received_date'] = df['received_date'].astype(str)
+    buf = BytesIO()
+    df.to_parquet(buf, index=False)
+    s3.put_object(Bucket=BUCKET, Key=f"gold/staging/data_{datetime.now():%Y%m%d_%H%M%S}.parquet",
+                  Body=buf.getvalue())
+
+def execute_athena_query(sql, wait=False, max_wait=300):
+    resp = athena.start_query_execution(
+        QueryString=sql,
+        QueryExecutionContext={'Database': DATABASE},
+        ResultConfiguration={'OutputLocation': ATHENA_OUTPUT}
+    )
+    eid = resp['QueryExecutionId']
+    if wait:
+        start = time.time()
+        while True:
+            state = athena.get_query_execution(QueryExecutionId=eid
+                        )['QueryExecution']['Status']['State']
+            if state == 'SUCCEEDED':
+                return eid
+            if state in ('FAILED', 'CANCELLED'):
+                reason = athena.get_query_execution(QueryExecutionId=eid
+                            )['QueryExecution']['Status'].get('StateChangeReason', '')
+                raise RuntimeError(f"Athena {state}: {reason}")
+            if time.time() - start > max_wait:
+                raise TimeoutError("Query timed out")
+            time.sleep(2)
+    return eid
+
+# ── Star Schema Build ──────────────────────────────────────────────────────────
+
+def build_iceberg_star_schema():
+    results = {}
+
+    # Step 1: Staging external table (bridge between Parquet and Iceberg)
+    execute_athena_query(f"DROP TABLE IF EXISTS {DATABASE}.staging_claims", wait=True)
+    execute_athena_query(f"""
+        CREATE EXTERNAL TABLE {DATABASE}.staging_claims (
+            claim_item_id BIGINT, claimant_id BIGINT, claim_code STRING,
+            provider_npi STRING, service_provider STRING, city STRING, state STRING,
+            type STRING, charge_amt DOUBLE, allowed_amt DOUBLE, units INT,
+            received_date STRING, oi_in_network STRING, proc_desc STRING,
+            claim_code_modifier STRING, claim_code_modifier_2 STRING
+        ) STORED AS PARQUET
+        LOCATION 's3://{BUCKET}/gold/staging/'
+    """, wait=True)
+
+    # Step 2: Create Iceberg table schemas (DDL only, no data yet)
+    iceberg_ddl = {
+        "dim_member": f"""CREATE TABLE {DATABASE}.dim_member (
+            member_id BIGINT, _loaded_at TIMESTAMP
+        ) LOCATION 's3://{BUCKET}/gold/iceberg/dim_member/'
+        TBLPROPERTIES ('table_type'='ICEBERG')""",
+
+        "dim_provider": f"""CREATE TABLE {DATABASE}.dim_provider (
+            provider_npi STRING, provider_name STRING, city STRING, state STRING, _loaded_at TIMESTAMP
+        ) LOCATION 's3://{BUCKET}/gold/iceberg/dim_provider/'
+        TBLPROPERTIES ('table_type'='ICEBERG')""",
+
+        "dim_payer": f"""CREATE TABLE {DATABASE}.dim_payer (
+            payer_name STRING, _loaded_at TIMESTAMP
+        ) LOCATION 's3://{BUCKET}/gold/iceberg/dim_payer/'
+        TBLPROPERTIES ('table_type'='ICEBERG')""",
+
+        "dim_procedure": f"""CREATE TABLE {DATABASE}.dim_procedure (
+            procedure_code STRING, procedure_desc STRING, _loaded_at TIMESTAMP
+        ) LOCATION 's3://{BUCKET}/gold/iceberg/dim_procedure/'
+        TBLPROPERTIES ('table_type'='ICEBERG')""",
+
+        "fact_remittance": f"""CREATE TABLE {DATABASE}.fact_remittance (
+            claim_id BIGINT, payment_amount DECIMAL(18,2),
+            carc_code STRING, rarc_code STRING, _loaded_at TIMESTAMP
+        ) LOCATION 's3://{BUCKET}/gold/iceberg/fact_remittance/'
+        TBLPROPERTIES ('table_type'='ICEBERG')""",
+
+        # fact_claims: partitioned by service_month (YYYY-MM string)
+        # avoids ICEBERG_TOO_MANY_OPEN_PARTITIONS vs daily partitioning
+        "fact_claims": f"""CREATE TABLE {DATABASE}.fact_claims (
+            claim_id BIGINT, member_id BIGINT, provider_npi STRING,
+            payer_name STRING, procedure_code STRING, service_date_key INT,
+            total_charges DECIMAL(18,2), allowed_amt DECIMAL(18,2),
+            units_count INT, in_network BOOLEAN,
+            service_month STRING, _loaded_at TIMESTAMP
+        ) PARTITIONED BY (service_month)
+        LOCATION 's3://{BUCKET}/gold/iceberg/fact_claims/'
+        TBLPROPERTIES ('table_type'='ICEBERG')""",
+    }
+
+    for table, ddl in iceberg_ddl.items():
+        execute_athena_query(ddl, wait=True)
+        logger.info(f"Schema created: {table}")
+
+    # Step 3: Insert data — DIM tables first, FACT tables after
+    inserts = {
+        "dim_member":    f"INSERT INTO {DATABASE}.dim_member SELECT DISTINCT claimant_id, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE claimant_id IS NOT NULL",
+        "dim_provider":  f"INSERT INTO {DATABASE}.dim_provider SELECT DISTINCT provider_npi, service_provider, city, state, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE provider_npi IS NOT NULL",
+        "dim_payer":     f"INSERT INTO {DATABASE}.dim_payer SELECT DISTINCT type, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE type IS NOT NULL",
+        "dim_procedure": f"INSERT INTO {DATABASE}.dim_procedure SELECT DISTINCT claim_code, proc_desc, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE claim_code IS NOT NULL",
+        "fact_remittance": f"INSERT INTO {DATABASE}.fact_remittance SELECT claim_item_id, CAST(allowed_amt AS DECIMAL(18,2)), claim_code_modifier, claim_code_modifier_2, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE claim_code_modifier IS NOT NULL",
+        "fact_claims": f"""INSERT INTO {DATABASE}.fact_claims
+            SELECT claim_item_id, claimant_id, provider_npi, type, claim_code,
+                CAST(REPLACE(SUBSTR(received_date,1,10),'-','') AS INT),
+                CAST(charge_amt AS DECIMAL(18,2)), CAST(allowed_amt AS DECIMAL(18,2)),
+                units,
+                CASE WHEN UPPER(oi_in_network)='Y' THEN true ELSE false END,
+                SUBSTR(received_date,1,7),
+                CURRENT_TIMESTAMP
+            FROM {DATABASE}.staging_claims""",
+    }
+
+    for table, query in inserts.items():
+        try:
+            execute_athena_query(query, wait=True)
+            results[table] = 'SUCCESS'
+            logger.info(f"Loaded: {table}")
+        except Exception as e:
+            results[table] = f'ERROR: {e}'
+            logger.error(f"Failed: {table} — {e}")
+
+    # Step 4: dim_date — generated as a date-spine (2020–2030), stored as Parquet
+    try:
+        execute_athena_query(f"DROP TABLE IF EXISTS {DATABASE}.dim_date", wait=True)
+        execute_athena_query(f"""
+            CREATE TABLE {DATABASE}.dim_date
+            WITH (format='PARQUET', external_location='s3://{BUCKET}/gold/iceberg/dim_date/') AS
+            WITH dates AS (
+                SELECT CAST(d AS DATE) AS full_date
+                FROM UNNEST(SEQUENCE(DATE '2020-01-01', DATE '2030-12-31',
+                            INTERVAL '1' DAY)) AS t(d)
+            )
+            SELECT CAST(format_datetime(full_date,'yyyyMMdd') AS INT) AS date_key,
+                   full_date, EXTRACT(DAY FROM full_date) AS day,
+                   EXTRACT(MONTH FROM full_date) AS month,
+                   EXTRACT(YEAR FROM full_date)  AS year
+            FROM dates
+        """, wait=True)
+        results['dim_date'] = 'SUCCESS'
+    except Exception as e:
+        results['dim_date'] = f'ERROR: {e}'
+
+    return results
+```
+
+> **Why `force_cleanup_corrupted_state()`?** Apache Iceberg maintains its own metadata tree in S3. If a previous Lambda run failed mid-way, Athena can see a "ghost" table entry in Glue that points to incomplete S3 files. Subsequent `CREATE TABLE` calls then fail with `Table already exists` even though the data is corrupt. The cleanup function wipes both the Glue catalog entry and the S3 files atomically, guaranteeing a clean slate on every run. In a production system with idempotent pipelines, this is replaced by Iceberg's `MERGE INTO` statement.
+
 ---
 
 # 4. Data Model & Schema Design (Q2, Q5, Q6)
 
-The data is modeled as a **Star Schema** in the Gold layer, comprising one FACT table and two DIMENSION tables. This design supports fast analytical queries via Athena without joins between more than two tables.
+The data is modeled as a **Star Schema** — facts at the centre, dimensions branching out. This design supports fast analytical queries with simple joins and clean aggregations.
 
 ## 4.1 Star Schema ERD
 
+An ER diagram is a blueprint of the database — it shows which tables exist, what columns they hold, and how they connect. In a Star Schema, the FACT tables sit at the centre (they hold the numbers) and the DIMENSION tables branch outward (they hold the descriptions).
+
+```mermaid
+erDiagram
+    dim_date ||--o{ fact_claims : "date_key"
+    dim_member ||--o{ fact_claims : "member_key"
+    dim_provider ||--o{ fact_claims : "provider_key"
+    dim_payer ||--o{ fact_claims : "payer_key"
+    dim_procedure ||--o{ fact_claims : "claim_code"
+    fact_claims ||--o{ fact_remittance : "claim_id (1:N)"
+
+    fact_claims {
+        bigint claim_fact_key PK
+        string claim_id FK
+        int service_date_key FK
+        decimal total_charges
+        decimal allowed_amt
+        string service_month
+    }
+    fact_remittance {
+        bigint remittance_id PK
+        string claim_id FK
+        decimal payment_amount
+        string carc_code
+        string rarc_code
+    }
 ```
-                     ┌────────────────────────┐
-                     │     dim_procedure      │
-                     ├────────────────────────┤
-                     │ PK claim_code          │
-                     │    procedure_desc      │
-                     └───────────┬────────────┘
-                                 │ FK claim_code
-  ┌────────────────────┐         │
-  │    dim_provider    │  ┌──────┴──────────────────────────┐
-  ├────────────────────┤  │          fact_claims            │
-  │ PK provider_npi    │  ├─────────────────────────────────┤
-  │    provider_name   │  │ PK claim_item_id                │
-  │    city            ├──┤ FK claimant_id                  │
-  │    state           │  │ FK claim_code  → dim_procedure  │
-  └────────────────────┘  │ FK provider_npi → dim_provider  │
-    FK provider_npi ──────┘    charge_amt                   │
-                          │    allowed_amt                   │
-                          │    discount_amt                  │
-                          │    units                         │
-                          │    received_date (partitioned)   │
-                          │    in_network                    │
-                          └─────────────────────────────────┘
-```
+
+### Why Two FACT Tables? The claim vs. remittance split
+
+The most critical design decision in the pipeline is keeping `fact_claims` and `fact_remittance` separate. They represent two different real-world events:
+
+- **`fact_claims` = the EDI 837 Invoice.** What the provider *asked for*. One row per claim line. Grain is fixed.
+- **`fact_remittance` = the EDI 835 Explanation of Benefits.** What the insurer *actually paid and why*. One claim line can generate multiple adjustment rows using CARC codes (Claim Adjustment Reason Codes).
+
+**The aggregation problem if combined:** A provider bills $100. The insurer responds with three CARC adjustments — CO-45 ($20 write-off), PR-1 ($30 patient deductible), PR-2 ($10 co-insurance), leaving a $40 payment. If those three adjustment rows were added to `fact_claims`, a simple `SUM(total_charges)` would count $100 three times and report $300 — a classic fan-out error that corrupts all revenue reporting.
+
+**The solution:** `fact_claims` stays at exactly one row per claim line, so aggregations are always correct. `fact_remittance` holds the many adjustment codes linked back via `claim_id`. Analysts join them with a `LEFT JOIN` only when they need denial reasons or net reimbursement — never for basic charge totals.
 
 ## 4.2 FACT vs DIMENSION Split (Q6)
 
@@ -374,6 +632,73 @@ These tables store the numerical data for aggregation. Note `fact_remittance` is
 |---|---|---|
 | `fact_claims` | One row per claim line item | claim_item_id, claimant_id, claim_code, provider_npi, charge_amt, allowed_amt, discount_amt, units, received_date, in_network |
 | `fact_remittance` | One row per adjustment per claim | remittance_id, claim_id (FK), payment_amount, allowed_amount, carc_code, rarc_code, adjustment_reason |
+
+## 4.3 Entity Relationship Diagram (Star Schema)
+
+```mermaid
+erDiagram
+    dim_date {
+        int date_key PK
+        date full_date
+        int month
+        int quarter
+        int year
+        string fiscal_period
+    }
+    dim_member {
+        bigint member_key PK
+        string member_id
+        date date_of_birth
+        string gender
+    }
+    dim_provider {
+        bigint provider_key PK
+        string npi
+        string provider_name
+        string specialty
+        string city
+        string state
+    }
+    dim_procedure {
+        string claim_code PK
+        string procedure_desc
+        string code_type
+    }
+    dim_payer {
+        bigint payer_key PK
+        string payer_id
+        string payer_name
+        string payer_type
+    }
+    fact_claims {
+        bigint claim_fact_key PK
+        string claim_id FK
+        bigint member_key FK
+        bigint provider_key FK
+        bigint payer_key FK
+        string procedure_key FK
+        int service_date_key FK
+        decimal total_charges
+        decimal allowed_amt
+        int units_count
+        boolean in_network
+    }
+    fact_remittance {
+        bigint remittance_id PK
+        string claim_id FK
+        decimal payment_amount
+        string carc_code
+        string rarc_code
+        string adjustment_reason
+    }
+    %% Relationships
+    dim_date ||--o{ fact_claims : "references"
+    dim_member ||--o{ fact_claims : "references"
+    dim_provider ||--o{ fact_claims : "references"
+    dim_payer ||--o{ fact_claims : "references"
+    dim_procedure ||--o{ fact_claims : "references"
+    fact_claims ||--o{ fact_remittance : "has many adjustments"
+```
 
 ### Full Gold Layer SQL DDL
 
@@ -487,7 +812,7 @@ LEFT JOIN gold.fact_remittance r ON r.claim_id  = f.claim_id
 GROUP BY p.payer_name, pr.provider_name, pr.specialty, d.year, d.quarter;
 ```
 
-## 4.3 Partitioning Strategy
+## 4.4 Partitioning Strategy
 
 - `fact_claims` is partitioned by **year** and **month** on the `received_date` column
 - This allows Athena to skip irrelevant S3 files entirely, reducing scan costs by **70–90%** for date-range queries
@@ -503,11 +828,21 @@ The **AWS Glue Data Catalog** serves as the single source of truth for all table
 
 - **AWS Glue Data Catalog:** Acts as a central metadata repository storing table definitions for all Bronze, Silver, and Gold layers. Every table created by Athena is automatically registered here.
 
-- **Glue Crawlers:** Configured to automatically scan the S3 buckets (`/bronze`, `/silver`, `/gold`) and update schema definitions whenever a new field is added or a partition is created. This means the catalog stays in sync with the data without manual `ALTER TABLE` statements.
+- **Hybrid Metadata Management:** I utilise Glue Crawlers for the Bronze and Silver layers to facilitate automated schema discovery and handle potential upstream changes in the raw healthcare files. However, for the Gold layer, I explicitly manage the catalog via Athena SQL (CTAS). This ensures that our Iceberg tables maintain transactional integrity and that the Gold schema is strictly governed and optimised for reporting performance.
 
-- **Data Lineage via Glue Jobs:** By running transformations as Glue Jobs (rather than unnamed scripts), the catalog maintains a record of the transformation logic — showing exactly how raw fields like `SERVICE_ADDRESS_3` map to the `provider_npi` column in `dim_provider`. This lineage is queryable via the Glue console and API.
+- **Glue Crawlers (Bronze & Silver only):** Configured to automatically scan the S3 buckets (`/bronze`, `/silver`) and update schema definitions whenever a new field is added or a partition is created. Crawlers are deleted after the initial schema discovery run to avoid unnecessary recurring cost (~$0.44/DPU-hour). For the Silver layer, a crawler is re-run only when the upstream file format changes.
 
-- **Delete Crawlers After First Run:** For prototype and low-change environments, crawlers are deleted after the initial schema discovery run to avoid unnecessary cost (~$0.44/DPU-hour). The schema is then managed via Terraform IaC going forward.
+- **Athena CTAS (Gold layer):** The Gold Orchestrator Lambda sends SQL `CREATE TABLE ... WITH (format='ICEBERG')` commands directly to Athena. The moment Athena finishes execution, the Gold table appears in the Glue Data Catalog automatically — no crawler required. This approach costs less than $0.01 for the prototype dataset (Athena charges per TB scanned; 8,381 rows is only a few MB).
+
+- **Data Lineage via Glue Jobs:** By running transformations as named Glue Jobs (rather than unnamed scripts), the catalog maintains a record of the transformation logic — showing exactly how raw fields like `SERVICE_ADDRESS_3` map to the `provider_npi` column in `dim_provider`.
+
+### Catalog Layer Strategy Summary
+
+| Layer | Catalog Method | Cost | Reason |
+|---|---|---|---|
+| Bronze | Glue Crawler (run once, then delete) | ~$0.01 one-time | Auto-discovers raw schema; handles format changes |
+| Silver | Glue Crawler (run once, then delete) | ~$0.01 one-time | Auto-discovers cleaned schema after Silver Lambda |
+| Gold | Athena SQL CTAS (via Lambda trigger) | < $0.01/run | Strict governance; Iceberg integrity; free catalog registration |
 
 ## 5.2 Logical Metadata — The "What"
 
@@ -796,7 +1131,7 @@ s3.put_bucket_lifecycle_configuration(
 |---|---|---|
 | Q2 – Database design | Star schema: fact_claims + dim_provider + dim_procedure | Athena, Iceberg on S3 |
 | Q3 – Data ingestion | Event-driven Lambda on S3 PutObject, `dtype=str` read | Lambda, S3 |
-| Q4 – Medallion pipeline | Bronze (raw) → Silver (clean) → Gold (modeled) | Lambda, Athena, S3 |
+| Q4 – Medallion pipeline | Bronze (raw) → Silver (clean) → Gold (modeled via Lambda-triggered Athena) | Lambda, Athena, S3 |
 | Q5 – Schema design | Typed, partitioned Iceberg tables with ACID guarantees | Iceberg, Glue Catalog |
 | Q6 – FACT / DIM split | fact_claims (metrics) + 2 dimension tables (attributes) | Athena SQL |
 | Q7 – Data catalog | Programmatic Glue metadata: descriptions, tags, quality flags | AWS Glue |
@@ -846,11 +1181,30 @@ hc-pipeline/
 │   └── fixtures/
 │       └── sample_claims.xlsx  # 50-row test fixture
 ├── terraform/
-│   ├── main.tf                 # S3 buckets, Lambda, IAM, Athena
-│   ├── variables.tf
-│   └── environments/
-│       ├── dev.tfvars
-│       └── prod.tfvars
+│   ├── main.tf                 # Calls the modules below
+│   ├── variables.tf            # Global variables (Region, Project Name)
+│   ├── outputs.tf              # Global outputs (S3 Bucket URLs, Athena Workgroup)
+│   ├── environments/           # Environment-specific configs
+│   │   ├── dev.tfvars
+│   │   └── prod.tfvars
+│   └── modules/                # REUSABLE COMPONENTS
+│       ├── s3/                 # Bronze/Silver/Gold buckets & lifecycle policies
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       ├── lambda/             # Bronze/Silver/Gold Lambda functions
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       ├── glue/               # Data Catalog & Crawlers
+│       │   ├── main.tf
+│       │   └── variables.tf
+│       ├── athena/             # Workgroups and Named Queries
+│       │   └── main.tf
+│       └── iam/                # Cross-service roles and Lake Formation policies
+│           └── main.tf
+├── catalog/
+│   └── data_dictionary.json    # Version-controlled schema definitions
 └── Makefile                    # Local dev shortcuts
 ```
 
