@@ -157,6 +157,7 @@ ENV/
 env.bak/
 venv.bak/
 .virtual_documents/
+logs/
 
 # Spyder project settings
 .spyderproject
