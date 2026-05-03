@@ -1,6 +1,7 @@
 """
-GOLD LAYER: Create Iceberg tables from silver data
-Using AWS Glue Data Catalog + Iceberg format
+GOLD LAYER: Create 7 Apache Iceberg tables from silver data
+Architecture: Star Schema (Medallion - Gold) with ACID compliance
+Fix: Partitioning by service_month to prevent ICEBERG_TOO_MANY_OPEN_PARTITIONS
 """
 import boto3
 import pandas as pd
@@ -21,57 +22,40 @@ BUCKET = 'hc-pipeline-demo'
 DATABASE = 'healthcare_gold'
 ATHENA_OUTPUT = f's3://{BUCKET}/athena-results/'
 
-
 def lambda_handler(event, context):
-    """Gold layer: Create Iceberg tables with Glue Catalog"""
-    
     try:
         logger.info("="*60)
-        logger.info("GOLD LAYER - Creating Iceberg Tables")
+        logger.info("GOLD LAYER - Creating Iceberg Tables (Star Schema)")
         logger.info("="*60)
         
-        # Get silver file
-        silver_file = event.get('silver_file')
-        if not silver_file:
-            silver_file = get_latest_silver_file()
-        
+        # 1. Get silver file
+        silver_file = get_latest_silver_file()
         if not silver_file:
             return {'statusCode': 400, 'body': json.dumps({'error': 'No silver file'})}
         
-        logger.info(f"Processing: {silver_file}")
-        
-        # Read silver data
+        # 2. Read silver data
         response = s3.get_object(Bucket=BUCKET, Key=silver_file)
         df = pd.read_parquet(BytesIO(response['Body'].read()))
-        logger.info(f"Read {len(df)} rows")
+        logger.info(f"Read {len(df)} rows from {silver_file}")
         
-        # Create Glue Database (if not exists)
+        # 3. Create Glue Database
         create_glue_database()
         
-        # 🚨 ONE-TIME NUCLEAR RESET: Clean up any ghost tables or S3 metadata markers 🚨
-        # force_cleanup_corrupted_state()
+        # 4. Force cleanup of any locked/corrupted Iceberg states
+        force_cleanup_corrupted_state()
         
-        # Write data to staging
+        # 5. Write data to staging (Bypasses HIVE_BAD_DATA errors)
         staging_location = write_staging_data(df)
         
-        # Create Iceberg tables using proper syntax
-        create_iceberg_tables()
-        
-        # Load data into Iceberg tables
-        load_data_to_iceberg(staging_location)
-        
-        # Update Glue Catalog SAFELY
-        update_glue_catalog()
-        
-        logger.info(f"✅ GOLD LAYER COMPLETE")
+        # 6. Build all 7 Iceberg Tables
+        results = build_iceberg_star_schema()
         
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': 'Gold layer complete',
+                'message': 'Gold Iceberg layer complete',
                 'database': DATABASE,
-                'tables': ['fact_claims', 'dim_provider', 'dim_procedure'],
-                'catalog': 'AWS Glue Data Catalog',
+                'executions': results,
                 'staging_location': staging_location
             })
         }
@@ -84,27 +68,27 @@ def lambda_handler(event, context):
 
 
 def force_cleanup_corrupted_state():
-    """Force delete Glue tables and wipe S3 Iceberg paths to bypass Athena ghost state"""
-    tables_to_nuke = ['fact_claims', 'dim_provider', 'dim_procedure']
-    logger.info("🧹 Initiating forced cleanup of previous corrupted state...")
+    """Force delete Glue tables and wipe S3 paths to bypass Athena ghost state"""
+    tables_to_nuke = [
+        "dim_member", "dim_provider", "dim_payer", 
+        "dim_procedure", "fact_remittance", "fact_claims"
+    ]
+    logger.info("🧹 Initiating forced cleanup of corrupted Iceberg state...")
     
-    # 1. Force delete the tables from the Glue Data Catalog
+    # 1. Force delete the tables directly from the Glue Data Catalog
     for table_name in tables_to_nuke:
         try:
             glue.delete_table(DatabaseName=DATABASE, Name=table_name)
             logger.info(f"🧹 Force deleted '{table_name}' from Glue Catalog.")
         except Exception:
-            pass # Ignore if it doesn't exist
+            pass # Ignore if it doesn't exist in Glue
 
-    # 2. Force delete all files (including hidden delete markers) in S3
+    # 2. Force delete all underlying files in S3
     for table_name in tables_to_nuke:
         prefix = f"gold/iceberg/{table_name}/"
         try:
-            # Paginate in case there are many metadata files
             paginator = s3.get_paginator('list_objects_v2')
-            pages = paginator.paginate(Bucket=BUCKET, Prefix=prefix)
-            
-            for page in pages:
+            for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
                 if 'Contents' in page:
                     objects = [{'Key': obj['Key']} for obj in page['Contents']]
                     s3.delete_objects(Bucket=BUCKET, Delete={'Objects': objects})
@@ -114,7 +98,6 @@ def force_cleanup_corrupted_state():
 
 
 def create_glue_database():
-    """Create Glue Catalog database"""
     try:
         glue.create_database(
             DatabaseInput={
@@ -132,23 +115,47 @@ def write_staging_data(df):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     staging_key = f"gold/staging/data_{timestamp}.parquet"
     
+    # Force numeric types to float to prevent Athena CAST errors later
+    if 'charge_amt' in df.columns: df['charge_amt'] = df['charge_amt'].astype(float)
+    if 'allowed_amt' in df.columns: df['allowed_amt'] = df['allowed_amt'].astype(float)
+    # Force received_date to string to prevent INT32 HIVE_BAD_DATA errors
+    if 'received_date' in df.columns: df['received_date'] = df['received_date'].astype(str)
+    
     buffer = BytesIO()
     df.to_parquet(buffer, index=False)
     s3.put_object(Bucket=BUCKET, Key=staging_key, Body=buffer.getvalue())
-    
-    logger.info(f"✅ Staging data written: {staging_key} ({len(df)} rows)")
     return f"s3://{BUCKET}/{staging_key}"
 
 
-def create_iceberg_tables():
-    """Create Iceberg tables using proper Athena syntax"""
+def execute_athena_query(sql, wait=False, max_wait=300):
+    response = athena.start_query_execution(
+        QueryString=sql,
+        QueryExecutionContext={'Database': DATABASE},
+        ResultConfiguration={'OutputLocation': ATHENA_OUTPUT}
+    )
+    execution_id = response['QueryExecutionId']
     
-    # 1. Drop existing staging table to ensure schema updates
-    drop_staging_sql = f"DROP TABLE IF EXISTS {DATABASE}.staging_claims"
-    execute_athena_query(drop_staging_sql, wait=True)
-    logger.info("✅ Cleared old staging table schema")
+    if wait:
+        start_time = time.time()
+        while True:
+            status_response = athena.get_query_execution(QueryExecutionId=execution_id)
+            state = status_response['QueryExecution']['Status']['State']
+            if state == 'SUCCEEDED':
+                return execution_id
+            elif state in ['FAILED', 'CANCELLED']:
+                reason = status_response['QueryExecution']['Status'].get('StateChangeReason', '')
+                raise Exception(f"Athena query {state}: {reason}")
+            if time.time() - start_time > max_wait:
+                raise TimeoutError("Query timed out")
+            time.sleep(2)
+    return execution_id
 
-    # 2. Create staging table (matching Pandas DOUBLE outputs)
+
+def build_iceberg_star_schema():
+    results = {}
+    
+    # Step 1: Create Staging Table (The Bridge)
+    execute_athena_query(f"DROP TABLE IF EXISTS {DATABASE}.staging_claims", wait=True)
     staging_sql = f"""
     CREATE EXTERNAL TABLE {DATABASE}.staging_claims (
         claim_item_id BIGINT,
@@ -156,223 +163,134 @@ def create_iceberg_tables():
         claim_code STRING,
         provider_npi STRING,
         service_provider STRING,
-        provider_city STRING,
-        provider_state STRING,
+        city STRING,
+        state STRING,
+        type STRING,
         charge_amt DOUBLE,
         allowed_amt DOUBLE,
-        discount_amt DOUBLE,
-        discount_pct DOUBLE,
         units INT,
-        received_date DATE,
-        year INT,
-        month INT,
+        received_date STRING,
         oi_in_network STRING,
-        rev_code_procedure_description STRING
+        proc_desc STRING,
+        claim_code_modifier STRING,
+        claim_code_modifier_2 STRING
     )
     STORED AS PARQUET
     LOCATION 's3://{BUCKET}/gold/staging/'
     """
     execute_athena_query(staging_sql, wait=True)
-    logger.info("✅ Staging table created")
-    
-    # 3. Create Iceberg fact table (Keep as DECIMAL)
-    fact_sql = f"""
-    CREATE TABLE IF NOT EXISTS {DATABASE}.fact_claims (
-        claim_item_id BIGINT,
-        claimant_id BIGINT,
-        claim_code STRING,
-        provider_npi STRING,
-        charge_amt DECIMAL(10,2),
-        allowed_amt DECIMAL(10,2),
-        discount_amt DECIMAL(10,2),
-        units INT,
-        received_date DATE,
-        year INT,
-        month INT,
-        in_network BOOLEAN,
-        _loaded_at TIMESTAMP
-    )
-    PARTITIONED BY (year, month)
-    LOCATION 's3://{BUCKET}/gold/iceberg/fact_claims/'
-    TBLPROPERTIES ('table_type'='ICEBERG')
-    """
-    execute_athena_query(fact_sql, wait=True)
-    logger.info("✅ Iceberg fact table created")
-    
-    # 4. Create dimension tables
-    dim_provider_sql = f"""
-    CREATE TABLE IF NOT EXISTS {DATABASE}.dim_provider (
-        provider_npi STRING,
-        provider_name STRING,
-        city STRING,
-        state STRING,
-        _loaded_at TIMESTAMP
-    )
-    LOCATION 's3://{BUCKET}/gold/iceberg/dim_provider/'
-    TBLPROPERTIES ('table_type'='ICEBERG')
-    """
-    execute_athena_query(dim_provider_sql, wait=True)
-    logger.info("✅ Iceberg dim_provider table created")
-    
-    dim_procedure_sql = f"""
-    CREATE TABLE IF NOT EXISTS {DATABASE}.dim_procedure (
-        claim_code STRING,
-        procedure_desc STRING,
-        _loaded_at TIMESTAMP
-    )
-    LOCATION 's3://{BUCKET}/gold/iceberg/dim_procedure/'
-    TBLPROPERTIES ('table_type'='ICEBERG')
-    """
-    execute_athena_query(dim_procedure_sql, wait=True)
-    logger.info("✅ Iceberg dim_procedure table created")
+    logger.info("✅ Staging table recreated")
 
+    # Step 2: Define Iceberg Tables (Schema Only)
+    iceberg_ddl = {
+        "dim_member": f"""
+            CREATE TABLE {DATABASE}.dim_member (
+                member_id BIGINT, _loaded_at TIMESTAMP
+            ) LOCATION 's3://{BUCKET}/gold/iceberg/dim_member/' TBLPROPERTIES ('table_type'='ICEBERG')
+        """,
+        "dim_provider": f"""
+            CREATE TABLE {DATABASE}.dim_provider (
+                provider_npi STRING, provider_name STRING, city STRING, state STRING, _loaded_at TIMESTAMP
+            ) LOCATION 's3://{BUCKET}/gold/iceberg/dim_provider/' TBLPROPERTIES ('table_type'='ICEBERG')
+        """,
+        "dim_payer": f"""
+            CREATE TABLE {DATABASE}.dim_payer (
+                payer_name STRING, _loaded_at TIMESTAMP
+            ) LOCATION 's3://{BUCKET}/gold/iceberg/dim_payer/' TBLPROPERTIES ('table_type'='ICEBERG')
+        """,
+        "dim_procedure": f"""
+            CREATE TABLE {DATABASE}.dim_procedure (
+                procedure_code STRING, procedure_desc STRING, _loaded_at TIMESTAMP
+            ) LOCATION 's3://{BUCKET}/gold/iceberg/dim_procedure/' TBLPROPERTIES ('table_type'='ICEBERG')
+        """,
+        "fact_remittance": f"""
+            CREATE TABLE {DATABASE}.fact_remittance (
+                claim_id BIGINT, payment_amount DECIMAL(18,2), carc_code STRING, rarc_code STRING, _loaded_at TIMESTAMP
+            ) LOCATION 's3://{BUCKET}/gold/iceberg/fact_remittance/' TBLPROPERTIES ('table_type'='ICEBERG')
+        """,
+        "fact_claims": f"""
+            CREATE TABLE {DATABASE}.fact_claims (
+                claim_id BIGINT, 
+                member_id BIGINT, 
+                provider_npi STRING, 
+                payer_name STRING, 
+                procedure_code STRING, 
+                service_date_key INT, 
+                total_charges DECIMAL(18,2), 
+                allowed_amt DECIMAL(18,2), 
+                units_count INT, 
+                in_network BOOLEAN, 
+                service_month STRING,
+                _loaded_at TIMESTAMP
+            ) 
+            PARTITIONED BY (service_month)
+            LOCATION 's3://{BUCKET}/gold/iceberg/fact_claims/' TBLPROPERTIES ('table_type'='ICEBERG')
+        """
+    }
 
-def load_data_to_iceberg(staging_location):
-    """Load data from staging to Iceberg tables"""
-    
-    # Load fact table with explicit casts for decimals
-    load_fact_sql = f"""
-    INSERT INTO {DATABASE}.fact_claims
-    SELECT 
-        claim_item_id,
-        claimant_id,
-        claim_code,
-        provider_npi,
-        CAST(charge_amt AS DECIMAL(10,2)),
-        CAST(allowed_amt AS DECIMAL(10,2)),
-        CAST(discount_amt AS DECIMAL(10,2)),
-        units,
-        received_date,
-        year,
-        month,
-        CASE WHEN oi_in_network = 'Y' THEN true ELSE false END as in_network,
-        CURRENT_TIMESTAMP as _loaded_at
-    FROM {DATABASE}.staging_claims
-    """
-    execute_athena_query(load_fact_sql, wait=True)
-    logger.info("✅ Data loaded to fact_claims")
-    
-    # Load dim_provider
-    load_provider_sql = f"""
-    INSERT INTO {DATABASE}.dim_provider
-    SELECT DISTINCT
-        provider_npi,
-        service_provider as provider_name,
-        provider_city as city,
-        provider_state as state,
-        CURRENT_TIMESTAMP as _loaded_at
-    FROM {DATABASE}.staging_claims
-    WHERE provider_npi IS NOT NULL
-    """
-    execute_athena_query(load_provider_sql, wait=True)
-    logger.info("✅ Data loaded to dim_provider")
-    
-    # Load dim_procedure
-    load_procedure_sql = f"""
-    INSERT INTO {DATABASE}.dim_procedure
-    SELECT DISTINCT
-        claim_code,
-        rev_code_procedure_description as procedure_desc,
-        CURRENT_TIMESTAMP as _loaded_at
-    FROM {DATABASE}.staging_claims
-    WHERE claim_code IS NOT NULL
-    """
-    execute_athena_query(load_procedure_sql, wait=True)
-    logger.info("✅ Data loaded to dim_procedure")
+    # Execute DDL
+    for table, ddl in iceberg_ddl.items():
+        execute_athena_query(ddl, wait=True)
+        logger.info(f"✅ Defined Iceberg schema for {table}")
 
+    # Step 3: Insert Data into Iceberg Tables
+    insert_queries = {
+        "dim_member": f"INSERT INTO {DATABASE}.dim_member SELECT DISTINCT claimant_id, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE claimant_id IS NOT NULL",
+        "dim_provider": f"INSERT INTO {DATABASE}.dim_provider SELECT DISTINCT provider_npi, service_provider, city, state, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE provider_npi IS NOT NULL",
+        "dim_payer": f"INSERT INTO {DATABASE}.dim_payer SELECT DISTINCT type, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE type IS NOT NULL",
+        "dim_procedure": f"INSERT INTO {DATABASE}.dim_procedure SELECT DISTINCT claim_code, proc_desc, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE claim_code IS NOT NULL",
+        "fact_remittance": f"INSERT INTO {DATABASE}.fact_remittance SELECT claim_item_id, CAST(allowed_amt AS DECIMAL(18,2)), claim_code_modifier, claim_code_modifier_2, CURRENT_TIMESTAMP FROM {DATABASE}.staging_claims WHERE claim_code_modifier IS NOT NULL",
+        "fact_claims": f"""
+            INSERT INTO {DATABASE}.fact_claims
+            SELECT 
+                claim_item_id, 
+                claimant_id, 
+                provider_npi, 
+                type, 
+                claim_code,
+                CAST(REPLACE(SUBSTR(received_date, 1, 10), '-', '') AS INT) as service_date_key,
+                CAST(charge_amt AS DECIMAL(18,2)), 
+                CAST(allowed_amt AS DECIMAL(18,2)), 
+                units,
+                CASE WHEN UPPER(oi_in_network) = 'Y' THEN true ELSE false END, 
+                SUBSTR(received_date, 1, 7) as service_month,
+                CURRENT_TIMESTAMP
+            FROM {DATABASE}.staging_claims
+        """
+    }
 
-def execute_athena_query(sql, wait=False, max_wait=300):
-    """Execute Athena query and optionally wait for completion using polling"""
+    for table, query in insert_queries.items():
+        try:
+            execute_athena_query(query, wait=True)
+            results[table] = "SUCCESS"
+            logger.info(f"✅ Loaded data into {table}")
+        except Exception as e:
+            results[table] = f"ERROR: {e}"
+            logger.error(f"❌ Failed to load {table}: {e}")
+
+    # Step 4: Handle dim_date separately
     try:
-        logger.debug(f"Executing SQL: {sql[:200]}...")
-        
-        response = athena.start_query_execution(
-            QueryString=sql,
-            QueryExecutionContext={'Database': DATABASE},
-            ResultConfiguration={'OutputLocation': ATHENA_OUTPUT}
-        )
-        
-        execution_id = response['QueryExecutionId']
-        logger.info(f"Query started: {execution_id}")
-        
-        if wait:
-            start_time = time.time()
-            while True:
-                status_response = athena.get_query_execution(QueryExecutionId=execution_id)
-                state = status_response['QueryExecution']['Status']['State']
-                
-                if state == 'SUCCEEDED':
-                    logger.info(f"✅ Query {execution_id} succeeded.")
-                    break
-                elif state in ['FAILED', 'CANCELLED']:
-                    reason = status_response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown reason')
-                    logger.error(f"❌ Query {execution_id} {state}: {reason}")
-                    raise Exception(f"Athena query {state}: {reason}")
-                
-                if time.time() - start_time > max_wait:
-                    raise TimeoutError(f"Query {execution_id} timed out after {max_wait} seconds")
-                    
-                time.sleep(2)
-            
-        return execution_id
-        
+        execute_athena_query(f"DROP TABLE IF EXISTS {DATABASE}.dim_date", wait=True)
+        execute_athena_query(f"""
+            CREATE TABLE {DATABASE}.dim_date
+            WITH (format = 'PARQUET', external_location = 's3://{BUCKET}/gold/iceberg/dim_date/') AS
+            WITH date_series AS (
+                SELECT CAST(date_column AS DATE) as full_date FROM UNNEST(SEQUENCE(DATE '2020-01-01', DATE '2030-12-31', INTERVAL '1' DAY)) AS t(date_column)
+            )
+            SELECT CAST(format_datetime(full_date, 'yyyyMMdd') AS INT) AS date_key, full_date, EXTRACT(DAY FROM full_date) AS day, EXTRACT(MONTH FROM full_date) AS month, EXTRACT(YEAR FROM full_date) AS year
+            FROM date_series
+        """, wait=True)
+        results["dim_date"] = "SUCCESS"
+        logger.info("✅ Created dim_date")
     except Exception as e:
-        logger.error(f"Athena query execution failed: {e}")
-        raise
+        results["dim_date"] = f"ERROR: {e}"
 
-
-def update_glue_catalog():
-    """Update Glue Catalog with table metadata SAFELY"""
-    
-    try:
-        # 1. Fetch the existing table definition created by Athena
-        existing_table = glue.get_table(DatabaseName=DATABASE, Name='fact_claims')['Table']
-        
-        # 2. Remove system-generated keys that will cause update_table to fail
-        keys_to_remove = [
-            'DatabaseName', 'CreateTime', 'UpdateTime', 'CreatedBy', 
-            'IsRegisteredWithLakeFormation', 'CatalogId', 'VersionId', 'FederatedTable'
-        ]
-        for key in keys_to_remove:
-            existing_table.pop(key, None)
-            
-        # 3. Update description and append our custom parameters
-        existing_table['Description'] = 'Fact table for healthcare claim line items - One row per claim line'
-        
-        if 'Parameters' not in existing_table:
-            existing_table['Parameters'] = {}
-            
-        existing_table['Parameters'].update({
-            'source_layer': 'gold',
-            'update_frequency': 'daily',
-            'data_quality': 'validated'
-        })
-        
-        # 4. Safely push the full definition back to Glue
-        glue.update_table(
-            DatabaseName=DATABASE,
-            TableInput=existing_table
-        )
-        logger.info("✅ Glue Catalog metadata updated safely")
-        
-    except Exception as e:
-        logger.warning(f"Could not update table metadata: {e}")
+    return results
 
 
 def get_latest_silver_file():
-    """Find latest parquet in silver folder"""
     response = s3.list_objects_v2(Bucket=BUCKET, Prefix='silver/')
-    
-    if 'Contents' not in response:
-        logger.info("No files in silver folder")
-        return None
-    
+    if 'Contents' not in response: return None
     parquet_files = [obj for obj in response['Contents'] if obj['Key'].endswith('.parquet')]
-    
-    if not parquet_files:
-        logger.info("No parquet files in silver folder")
-        return None
-    
-    latest = max(parquet_files, key=lambda x: x['LastModified'])
-    logger.info(f"Latest silver file: {latest['Key']}")
-    return latest['Key']
+    if not parquet_files: return None
+    return max(parquet_files, key=lambda x: x['LastModified'])['Key']
